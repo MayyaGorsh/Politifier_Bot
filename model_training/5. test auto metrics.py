@@ -1,16 +1,38 @@
 import json
 from tqdm import tqdm
-from transformers import T5ForConditionalGeneration, AutoTokenizer
+from transformers import T5ForConditionalGeneration, AutoTokenizer, MT5ForConditionalGeneration, MBartForConditionalGeneration
 from bert_score import score as bert_score
 from sacrebleu.metrics import CHRF
 from natasha import Segmenter, NewsEmbedding, NewsNERTagger, Doc
 import torch
 from transformers import pipeline
 
+flag = False
+device = torch.device("cuda" if torch.cuda.is_available() and flag else "cpu")
+
 # Инициализация NER
 segmenter = Segmenter()
 emb = NewsEmbedding()
 ner_tagger = NewsNERTagger(emb)
+
+test_phrases = [
+    "что за фигню ты 8го на совещании ляпнул? А как мне то быть если Ваня ниче не делает. Я завтра не приду, "
+    "сам решай наши задачи.",
+    "08.03 не приду",
+    "ну что за жесть почему опять у вас ничего не получается",
+    "Нет, я не собираюсь ехать. Пусть кто-то другой этим занимается.",
+    "Всё, вопрос закрыт: испытательный срок три месяца, и никто не сделает исключений.",
+    "сделайте пожалуста как можно быстрее",
+    "Рабочий день же закончился, какого хрена я всё ещё тут?",
+    "Гениальная инициатива, как и все предыдущие – бесполезная и ненужная.",
+    "Ты опять забыл про сроки для семинара? Это уже начинает раздражать. Все материалы должны быть готовы за два дня, "
+    "а у нас до сих пор нет даже списка участников. Как ты вообще планируешь всё успеть?",
+    "Отвали"
+]
+
+
+def add_para(line):
+    return 'paraphrase politely: ' + line
 
 
 def extract_named_entities(text):
@@ -20,7 +42,7 @@ def extract_named_entities(text):
     return {span.text for span in doc.spans}
 
 
-def evaluate_model(model, tokenizer, dataset_path, max_tokens=128, batch_size=8):
+def evaluate_model(model, tokenizer, dataset_path, max_tokens=128, batch_size=8, mbart=False):
     # Чтение датасета с прогрессбаром
     data = []
     with open(dataset_path, "r", encoding="utf-8") as f:
@@ -35,14 +57,27 @@ def evaluate_model(model, tokenizer, dataset_path, max_tokens=128, batch_size=8)
     for i in tqdm(range(0, len(inputs), batch_size), desc="Generating outputs (8 sent * 125 iter)"):
         batch_inputs = inputs[i:i+batch_size]
         inputs_tokenized = tokenizer(batch_inputs, return_tensors="pt", padding=True, truncation=True)
-        with torch.no_grad():
-            generated_ids = model.generate(
-                input_ids=inputs_tokenized["input_ids"],
-                attention_mask=inputs_tokenized["attention_mask"],
-                max_new_tokens=max_tokens
-            )
-        for g in generated_ids:
-            predictions.append(tokenizer.decode(g, skip_special_tokens=True))
+        inputs_tokenized = {k: v.to(device) for k, v in inputs_tokenized.items()}
+        if mbart:
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs_tokenized,
+                    forced_bos_token_id=tokenizer.lang_code_to_id[tokenizer.tgt_lang],
+                    max_length=max_tokens,
+                    num_beams=4,
+                    do_sample=True,
+                    temperature=1.0,
+                )
+            predictions += [tokenizer.decode(g, skip_special_tokens=True) for g in outputs]
+        else:
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    input_ids=inputs_tokenized["input_ids"],
+                    attention_mask=inputs_tokenized["attention_mask"],
+                    max_new_tokens=max_tokens
+                )
+            for g in generated_ids:
+                predictions.append(tokenizer.decode(g, skip_special_tokens=True))
     print(f"Всего сгенерировано: {len(predictions)} / {len(inputs)}")
 
     # BERTScore
@@ -91,28 +126,86 @@ def evaluate_model(model, tokenizer, dataset_path, max_tokens=128, batch_size=8)
     }
 
 
-base_model_name = 'ai-forever/ruT5-base'
-old_model_name = 's-nlp/ruT5-base-detox'
-new_model_path_1 = "ruT5-base-detox-polite"
-new_model_path_2 = "ruT5-base-detox-polite-NER"
+def show_examples(model, tokenizer, prompts, max_tokens=128):
+    print("-" * 60)
+    print("Примеры детоксификации:")
+    for i, text in enumerate(prompts, 1):
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=max_tokens
+            )
+        output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        print(f"{i}. TOXIC: {text}\n   DETOX:   {output}\n")
 
-tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-old_model = T5ForConditionalGeneration.from_pretrained(old_model_name)
-new_model_1 = T5ForConditionalGeneration.from_pretrained(new_model_path_1)
-new_model_2 = T5ForConditionalGeneration.from_pretrained(new_model_path_2)
 
-print(f'Метрики для ruT5-base-detox (старая модель):')
-metrics = evaluate_model(old_model, tokenizer, "test.jsonl")
-print(metrics)
-print()
+candidates = {
+    "ruT5-base": 'ai-forever/ruT5-base',
+    "detox": 's-nlp/ruT5-base-detox',
+    "paraphraser": 'cointegrated/rut5-base-paraphraser',
+    "mt5-base": 'google/mt5-base',
+    "mbart-detox": "s-nlp/mbart-detox-en-ru",
+    "rut5-detox-v2": "orzhan/rut5-base-detox-v2",
+    "mbart-multilingual-detox": "textdetox/mbart-detox-baseline",
+    "ruT5-base-detox-polite (новая модель)": "ruT5-base-detox-polite",
+    "ruT5-base-detox-polite-NER (новая модель с Natasha)": "ruT5-base-detox-polite-NER",
+}
 
-print(f'Метрики для ruT5-base-detox-polite (новая модель):')
-metrics = evaluate_model(new_model_1, tokenizer, "test.jsonl")
-print(metrics)
-print()
+for name, path in candidates.items():
+    if "mbart" in name:
 
-print(f'Метрики для ruT5-base-detox-polite-NER (новая модель с Natasha):')
-metrics = evaluate_model(new_model_2, tokenizer, "test.jsonl")
-print(metrics)
-print()
+        model = MBartForConditionalGeneration.from_pretrained(path).to(device)
+        tokenizer = AutoTokenizer.from_pretrained("facebook/mbart-large-50")
+        tokenizer.src_lang = "ru_RU"
+        tokenizer.tgt_lang = "ru_RU"
+
+        print(f"🔎 Модель: {name}")
+        metrics = evaluate_model(model, tokenizer, "test.jsonl", mbart=True)
+        print(metrics)
+
+        def show_examples_mbart(model, tokenizer, prompts, max_tokens=128):
+            print("-" * 60)
+            print(f"Примеры детоксификации ({name}):")
+            for i, text in enumerate(prompts, 1):
+                inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(model.device)
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        forced_bos_token_id=tokenizer.lang_code_to_id[tokenizer.tgt_lang],
+                        max_length=max_tokens,
+                        num_beams=4,
+                        do_sample=True,
+                        temperature=1.0,
+                    )
+                decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print(f"{i}. TOXIC: {text}\n   DETOX:   {decoded}\n")
+
+
+        show_examples_mbart(model, tokenizer, test_phrases)
+
+    elif name == 'mt5-base':
+        model = MT5ForConditionalGeneration.from_pretrained(path).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        print(f"🔎 Модель: {name}")
+        metrics = evaluate_model(model, tokenizer, "test.jsonl")
+        print(metrics)
+        show_examples(model, tokenizer, list(map(add_para, test_phrases)))
+
+    else:
+        model = T5ForConditionalGeneration.from_pretrained(path).to(device)
+        if 'новая' in name:
+            tokenizer = AutoTokenizer.from_pretrained('ai-forever/ruT5-base')
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(path)
+        print(f"🔎 Модель: {name}")
+        metrics = evaluate_model(model, tokenizer, "test.jsonl")
+        print(metrics)
+        show_examples(model, tokenizer, test_phrases)
+    print()
+
+
+
 
