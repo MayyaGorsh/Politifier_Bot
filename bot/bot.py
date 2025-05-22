@@ -3,10 +3,11 @@ import logging
 from datetime import datetime, date
 
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
 from aiogram.filters.command import Command, CommandObject
 import uuid
 from Politify_function import Politify
-from token import token
+from my_token import token
 
 
 logging.basicConfig(level=logging.INFO)
@@ -47,11 +48,10 @@ async def cmd_help(message: types.Message):
 async def inline_query_handler(inline_query: types.InlineQuery):
     query = inline_query.query.strip()
     results = []
-
     user_id = inline_query.from_user.id
     today = date.today()
-
     show_help_button = False
+
     if user_id not in last_shown or last_shown[user_id] != today:
         last_shown[user_id] = today
         show_help_button = True
@@ -63,23 +63,28 @@ async def inline_query_handler(inline_query: types.InlineQuery):
             switch_pm_text="ℹ️ Как пользоваться ботом?",
             switch_pm_parameter="help"
         )
-    else:
-        if query:
-            # Create a single article result that, when chosen, sends 'query' as the message
-            polite_version = Politify(query)
+        return
 
-            results.append(
-                types.InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title="Нажмите, чтобы отправить вежливую версию сообщения.",
-                    description=polite_version,
-                    input_message_content=types.InputTextMessageContent(message_text=polite_version)
-                )
-            )
+    if not query:
+        await inline_query.answer([], cache_time=1)
+        return
 
-        # Answer the inline query with the results
-        print(inline_query.id)
-        await inline_query.answer(results, cache_time=3)  # Set cache_time=1 for testing; can be higher in production
+    # Create a single article result that, when chosen, sends 'query' as the message
+    polite_version = await asyncio.to_thread(Politify, query)
+
+    result = InlineQueryResultArticle(
+        id=str(uuid.uuid4()),
+        title="Нажмите, чтобы отправить вежливую версию сообщения.",
+        description=polite_version,
+        input_message_content=InputTextMessageContent(message_text=polite_version)
+    )
+
+    # Answer the inline query with the results
+    print(inline_query.id)
+    try:
+        await inline_query.answer([result], cache_time=1, is_personal=True)
+    except Exception as e:
+        print(f"❗ Ошибка при отправке inline-ответа: {e}")
 
 
 async def main():
